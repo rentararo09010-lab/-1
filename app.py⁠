@@ -1,0 +1,175 @@
+import json
+import requests
+import streamlit as st
+from openai import OpenAI
+
+# ページ基本設定
+st.set_page_config(page_title="AI Fact Checker Pro", layout="wide")
+st.title("🔍 AI Fact Checker Pro")
+st.write("Google Custom Search または Perplexity API を選択してWeb上の最新根拠を取得し、ファクトチェックを行います。")
+
+# サイドバーの設定
+with st.sidebar:
+    st.header("⚙️ 設定・APIキー")
+    
+    # 検索エンジンの選択
+    search_engine = st.radio(
+        "使用する検索・分析エンジンを選択",
+        ("Google Custom Search + GPT-4o", "Perplexity API (sonar-pro)")
+    )
+    
+    st.divider()
+    
+    # 必要キーの入力
+    openai_key = st.text_input("OpenAI API Key", type="password")
+    perplexity_key = st.text_input("Perplexity API Key", type="password")
+    google_api_key = st.text_input("Google Custom Search API Key", type="password")
+    google_cx = st.text_input("Google Search Engine ID (CX)")
+
+
+# -------------------------------------------------------------------
+# 1. Google Custom Search 用関数
+# -------------------------------------------------------------------
+def search_google(query, api_key, cx, num_results=4):
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": api_key, "cx": cx, "q": query, "num": num_results}
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        results = []
+        if "items" in data:
+            for item in data["items"]:
+                results.append({
+                    "title": item.get("title"),
+                    "link": item.get("link"),
+                    "snippet": item.get("snippet")
+                })
+        return results
+    except Exception as e:
+        st.error(f"Google検索エラー: {e}")
+        return []
+
+def verify_with_google_and_gpt(text, search_results, openai_api_key):
+    client = OpenAI(api_key=openai_api_key)
+    context = ""
+    for idx, res in enumerate(search_results, 1):
+        context += f"[{idx}] タイトル: {res['title']}\n概要: {res['snippet']}\nURL: {res['link']}\n\n"
+
+    prompt = f"""
+以下の「検証対象テキスト」について、添付された「Web検索結果」を根拠にしてファクトチェックを行ってください。
+
+【検証対象テキスト】
+{text}
+
+【参照されたWeb検索結果】
+{context if context else "（有効な検索結果が得られませんでした）"}
+
+【指示】
+・テキストの真偽（正確/一部誤り/誤り/根拠なし）を判断してください。
+・信頼度スコア（0〜100%）を明記してください。
+・結論と理由をわかりやすく箇条書きでまとめてください。
+"""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return response.choices[0].message.content
+
+
+# -------------------------------------------------------------------
+# 2. Perplexity API 用関数
+# -------------------------------------------------------------------
+def verify_with_perplexity(text, perplexity_api_key):
+    url = "https://api.perplexity.ai/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {perplexity_api_key}",
+        "Content-Type": "application/json"
+    }
+    prompt = f"""
+以下のテキストについてファクトチェックを行い、最新のWeb情報に基づいた検証結果と信頼度スコア（0〜100%）を出力してください。
+
+【検証対象テキスト】
+{text}
+"""
+    payload = {
+        "model": "sonar-pro",
+        "messages": [
+            {"role": "system", "content": "あなたは公正かつ正確なファクトチェッカーです。分析結果と信頼度スコアを出力してください。"},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        data = response.json()
+        
+        answer = data['choices'][0]['message']['content']
+        citations = data.get('citations', [])
+        return answer, citations
+    except Exception as e:
+        st.error(f"Perplexity API エラー: {e}")
+        return None, []
+
+
+# -------------------------------------------------------------------
+# 画面・メイン処理
+# -------------------------------------------------------------------
+input_text = st.text_area(
+    "検証したいテキストを入力してください",
+    height=120,
+    placeholder="例：日本の消費税は2026年に15%に引き上げられることが決定した。"
+)
+
+if st.button("ファクトチェックを実行", type="primary"):
+    if not input_text:
+        st.warning("検証したいテキストを入力してください。")
+    else:
+        st.divider()
+        col_main, col_sources = st.columns([2, 1])
+
+        if search_engine == "Google Custom Search + GPT-4o":
+            if not openai_key or not google_api_key or not google_cx:
+                st.warning("OpenAI API Key、Google API Key、Google Engine ID (CX) をすべて入力してください。")
+            else:
+                with st.spinner("GoogleでWeb検索中..."):
+                    search_results = search_google(input_text, google_api_key, google_cx)
+                
+                with st.spinner("GPT-4oで根拠を分析中..."):
+                    ai_analysis = verify_with_google_and_gpt(input_text, search_results, openai_key)
+
+                with col_main:
+                    st.subheader("📊 判定結果 (Google Search + GPT-4o)")
+                    st.markdown(ai_analysis)
+
+                with col_sources:
+                    st.subheader("🔗 参照したWebソース")
+                    if search_results:
+                        for idx, res in enumerate(search_results, 1):
+                            st.markdown(f"**[{idx}] [{res['title']}]({res['link']})**")
+                            st.caption(res['snippet'])
+                            st.divider()
+                    else:
+                        st.info("根拠となるWebソースが見つかりませんでした。")
+
+        elif search_engine == "Perplexity API (sonar-pro)":
+            if not perplexity_key:
+                st.warning("Perplexity API Key を入力してください。")
+            else:
+                with st.spinner("Perplexity (sonar-pro) がWeb全体をリアルタイム検証中..."):
+                    answer, citations = verify_with_perplexity(input_text, perplexity_key)
+
+                if answer:
+                    with col_main:
+                        st.subheader("📊 判定結果 (Perplexity sonar-pro)")
+                        st.markdown(answer)
+
+                    with col_sources:
+                        st.subheader("🔗 参照したWebソース")
+                        if citations:
+                            for idx, url in enumerate(citations, 1):
+                                st.markdown(f"**[{idx}] [{url}]({url})**")
+                                st.divider()
+                        else:
+                            st.info("参照ソースリンクが見つかりませんでした。")
